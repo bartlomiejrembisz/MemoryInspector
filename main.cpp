@@ -2,6 +2,8 @@
 #include <fstream>
 #include <iostream>
 
+#include <array>
+
 #include <regex>
 
 #include <unistd.h>
@@ -15,12 +17,16 @@
 
 const volatile char * volatile testString = "THIS IS MY STRING";
 
+constexpr size_t SIZE_PAGE = 0x1000;
+
 /*
  *  @brief  Get the memory dump for pid.
  */
-std::string GetMemoryDump(const std::string &processPid, const std::string &permissions);
+template <size_t SIZE = SIZE_PAGE>
+std::ostream &PrintMemoryDump(const std::string &processPid, const std::string &permissions, std::ostream &outStream = std::cout);
 
-std::string ConvertBufferToHexdump(const uint8_t *pBuffer, const size_t size, uint64_t startAddress = 0);
+template <size_t SIZE = SIZE_PAGE>
+std::ostream &PrintPage(const uint8_t *pBuffer, uint64_t startAddress = 0, std::ostream &outStream = std::cout);
 
 int main(int argc, char** argv)
 {
@@ -51,7 +57,7 @@ int main(int argc, char** argv)
     
     try
     {
-        std::cout << GetMemoryDump(processPid, permissions) << '\n';
+        PrintMemoryDump<SIZE_PAGE>(processPid, permissions);
     }
     catch(const std::exception& e)
     {
@@ -61,26 +67,28 @@ int main(int argc, char** argv)
     return 0;
 }
 
-std::string GetMemoryDump(const std::string &processPid, const std::string &permissions)
+template <size_t SIZE>
+std::ostream &PrintMemoryDump(const std::string &processPid, const std::string &permissions, std::ostream &outStream)
 {
+    //! Multiple of PAGE_SIZE
+    static_assert(0 == (SIZE % SIZE_PAGE), "SIZE needs to be PAGE_SIZE aligned");
+
     const std::regex lineRegex("([0-9A-Fa-f]+)-([0-9A-Fa-f]+) ([-r][-w][-x])");
     const std::string procPath(std::string("/proc/") + processPid);
     const std::string mapFilePath(procPath + "/maps");
     const std::string memFilePath(procPath + "/mem");
 
-    std::string output;
-
-    output += mapFilePath + '\n';
-    output += memFilePath + '\n';
+    outStream << std::hex;
+    outStream << mapFilePath << '\n';
+    outStream << memFilePath << '\n';
     
     std::ifstream mapFile(mapFilePath, std::ios::in);
     std::ifstream memFile(memFilePath, std::ios::in);
 
     if (!mapFile.is_open() || !memFile.is_open())
-        return output;
+        return outStream;
 
-    std::vector<uint8_t> buffer;
-    buffer.resize(4096);
+    std::array<uint8_t, SIZE> buffer;
 
     std::string line;
     while (std::getline(mapFile, line))
@@ -90,79 +98,85 @@ std::string GetMemoryDump(const std::string &processPid, const std::string &perm
         {
             if (3 < regexMatches.size())
             {
-                const uint64_t regionStart = std::stoull(regexMatches[1], 0, 16);
+                uint64_t regionTop = std::stoull(regexMatches[1], 0, 16);
                 const uint64_t regionEnd = std::stoull(regexMatches[2], 0, 16);
-                const size_t regionSize = regionEnd - regionStart;
+                size_t regionSize = regionEnd - regionTop;
                 const std::string regionPermissions(regexMatches[3]);
-
+                
                 if (!std::all_of(permissions.begin(), permissions.end(), [&](const char c) { return (regionPermissions.find(c) != std::string::npos); }))
                     continue;
+                
+                outStream << '\n' << line << '\n';
+                auto flags = outStream.flags();
+                outStream << "size=" << std::dec << regionSize << " bytes" << ", pages=" << (regionSize / SIZE) << '\n';
+                outStream.flags(flags);
+                for (; regionTop < regionEnd; regionTop += buffer.size())
+                {
+                    memFile.seekg(regionTop);
+                    memFile.read(reinterpret_cast<char *>(buffer.data()), buffer.size());
 
-                buffer.resize(regionSize);
-
-                memFile.seekg(regionStart);
-                memFile.read(reinterpret_cast<char *>(buffer.data()), regionSize);
-
-                // std::cout << std::hex << regionStart << " " << regionEnd << " " << regionPermissions << " " << regionSize << '\n';
-                output.append(line + '\n');
-                output.append(ConvertBufferToHexdump(buffer.data(), buffer.size(), regionStart) + '\n');
+                    outStream << "regionTop=0x" << regionTop << '\n';
+                    PrintPage<SIZE>(buffer.data(), regionTop, outStream) << '\n';
+                }
             }
         }
         else
         {
-            std::cout << "Regex match failure, line=" << line << '\n';
+            outStream << "Regex match failure, line=" << line << '\n';
         }
     }
 
     // std::stoull()
 
-    return output;
+    return outStream;
 }
 
-std::string ConvertBufferToHexdump(const uint8_t *pBuffer, const size_t bufferSize, uint64_t startAddress)
+template <size_t SIZE>
+std::ostream &PrintPage(const uint8_t *pBuffer, uint64_t startAddress, std::ostream &outStream)
 {
-    //! pointer + colon + (16 02 bytes + space) + 4 extra spaces + 18 for ascii
-    std::vector<char> output;
-    output.resize((bufferSize / 16) * (16 + 1 + (16 * 3) + 4 + 18) + 1);
+    //! Multiple of PAGE_SIZE
+    static_assert(0 == (SIZE % SIZE_PAGE), "SIZE needs to be PAGE_SIZE aligned");
 
-    size_t nBytesWritten = 0;
-    const size_t outputBufferSize = output.size();
+    constexpr size_t nBytesPerLine = 16;
+    constexpr size_t nLines = SIZE / nBytesPerLine;
+    constexpr size_t outputBufferSize = 84 + 3;
 
-    for (size_t nBytesDumped = 0; nBytesDumped < bufferSize;)
+    char outputBuffer[outputBufferSize];
+
+    const uint8_t *pNextLine = pBuffer;
+
+    for (size_t nLine = 0; nLine < nLines; ++nLine, pNextLine += nBytesPerLine)
     {
-        const size_t nBytesLeft = bufferSize - nBytesDumped;
-        const size_t nBytesToDump = (nBytesLeft > 16) ? 16 : nBytesLeft;
-        const uint8_t *pData = pBuffer + nBytesDumped;
+        if (std::all_of(pNextLine, pNextLine + nBytesPerLine, [](const uint8_t byte){ return 0 == byte; }))
+        	continue;
 
-        if (std::all_of(pData, pData + nBytesToDump, [](const uint8_t byte){ return 0 == byte; }))
-        {
-            nBytesDumped += nBytesToDump;
-            continue;
-        }
+        const size_t lineAddress = startAddress + (nLine * nBytesPerLine);
+        size_t nBytesWritten = 0;
 
         //! Append address.
-        nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, PRINTF_PTR ":  ", (startAddress + nBytesDumped));
+        nBytesWritten += snprintf(&outputBuffer[nBytesWritten], outputBufferSize - nBytesWritten, PRINTF_PTR ":  ", lineAddress);
         
-        for (size_t i = 0; i < nBytesToDump; ++i)
-            nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, PRINTF_BYTE " ",  *(pData + i));
+        for (size_t i = 0; i < nBytesPerLine / 2; ++i)
+            nBytesWritten += snprintf(&outputBuffer[nBytesWritten], outputBufferSize - nBytesWritten, PRINTF_BYTE " ",  *(pNextLine + i));
 
-        nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, " |");
-        for (size_t i = 0; i < nBytesToDump; ++i)
+        nBytesWritten += snprintf(&outputBuffer[nBytesWritten], outputBufferSize - nBytesWritten, "  ");
+
+        for (size_t i = 0; i < nBytesPerLine / 2; ++i)
+            nBytesWritten += snprintf(&outputBuffer[nBytesWritten], outputBufferSize - nBytesWritten, PRINTF_BYTE " ",  *(pNextLine + i));
+
+        nBytesWritten += snprintf(&outputBuffer[nBytesWritten], outputBufferSize - nBytesWritten, " |");
+        
+        for (size_t i = 0; i < nBytesPerLine; ++i)
         {
-            const char *pFormat = std::isprint(*(pData + i)) ? "%c" : ".";
-            nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, pFormat,  *(pData + i));
-            
-            // if (std::isprint(*(pData + i)))
-            //     nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, "%c",  *(pData + i));
-            // else
-            //     nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, ".");
+            const char * const pFormat = std::isprint(*(pNextLine + i)) ? "%c" : ".";
+            nBytesWritten += snprintf(&outputBuffer[nBytesWritten], outputBufferSize - nBytesWritten, pFormat,  *(pNextLine + i));
         }
-        nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, "|\n");
 
-        // nBytesWritten += snprintf(output.data() + nBytesWritten, outputBufferSize - nBytesWritten, PRINTF_DWORD,  pBuffer + nBytesDumped);
+        nBytesWritten += snprintf(&outputBuffer[nBytesWritten], outputBufferSize - nBytesWritten, "|");
 
-        nBytesDumped += nBytesToDump;
+        outStream << outputBuffer << '\n';
     }
 
-    return std::string(output.begin(), output.begin() + nBytesWritten);
+
+    return outStream;
 }
